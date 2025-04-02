@@ -153,8 +153,7 @@ def display_stats(result_queue, ip_list):
 
         time.sleep(1)
 
-# 主函数
-def main():
+if __name__ == "__main__":
     ip_list = load_ips()
     result_queue = queue.Queue()
 
@@ -162,6 +161,3 @@ def main():
         threading.Thread(target=ping_worker, args=(ip, result_queue), daemon=True).start()
 
     display_stats(result_queue, ip_list)
-
-if __name__ == "__main__":
-    main()
