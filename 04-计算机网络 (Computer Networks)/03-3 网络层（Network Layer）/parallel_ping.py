@@ -1,105 +1,153 @@
-#!/usr/bin/env python3
-import threading
-import time
 import os
+import time
+import struct
+import random
+import socket
+import threading
 import statistics
-from scapy.all import ICMP, IP, sr1, conf
+import queue
 
-# 读取 IP 地址列表 文件 ip.lst
-def load_ip_list(filename="ip.lst"):
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
+
+# 计算校验和
+def checksum(source_string):
+    sum = 0
+    count_to = (len(source_string) // 2) * 2
+    count = 0
+
+    while count < count_to:
+        this_val = source_string[count + 1] * 256 + source_string[count]
+        sum = sum + this_val
+        sum = sum & 0xFFFFFFFF
+        count += 2
+
+    if count_to < len(source_string):
+        sum = sum + source_string[-1]
+        sum = sum & 0xFFFFFFFF
+
+    sum = (sum >> 16) + (sum & 0xFFFF)
+    sum = sum + (sum >> 16)
+    answer = ~sum
+    answer = answer & 0xFFFF
+    answer = answer >> 8 | (answer << 8 & 0xFF00)
+    return answer
+
+# 发送 ICMP Echo Request
+def send_icmp_echo(sock, dest_addr, packet_id, seq_number):
+    timestamp = time.time()  # 发送时间（秒，带小数）
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, 0, packet_id, seq_number)
+    payload = struct.pack("!d", timestamp)  # 8字节时间戳
+    checksum_val = checksum(header + payload)
+    header = struct.pack("!BBHHH", ICMP_ECHO_REQUEST, 0, checksum_val, packet_id, seq_number)
+    packet = header + payload
+    sock.sendto(packet, (dest_addr, 1))
+
+# 接收 ICMP Echo Reply
+def receive_icmp_reply(sock, packet_id, seq_number):
+    try:
+        while True:
+            packet, addr = sock.recvfrom(1024)
+            icmp_header = packet[20:28]
+            type, code, checksum, p_id, seq = struct.unpack("!BBHHH", icmp_header)
+
+            if type == ICMP_ECHO_REPLY and p_id == packet_id and seq == seq_number:
+                recv_timestamp = struct.unpack("!d", packet[28:36])[0]  # 解析 8 字节时间戳
+                return recv_timestamp
+    except socket.timeout:
+        return None
+
+# 并行 Ping 线程
+def ping_worker(ip, result_queue):
+    stats = {
+        "IP": ip,
+        "Snt": 0,
+        "Recv": 0,
+        "Loss": 0.0,
+        "Last": 0.0000,
+        "Avg": 0.0000,
+        "Best": float("inf"),
+        "Wrst": 0.0000,
+        "StDev": 0.0000,
+        "RTTs": []
+    }
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    sock.settimeout(1)
+
+    while True:
+        packet_id = random.randint(0, 65535)
+        seq_number = stats["Snt"]
+
+        send_icmp_echo(sock, ip, packet_id, seq_number)
+        send_time = time.time()
+        stats["Snt"] += 1
+
+        recv_timestamp = receive_icmp_reply(sock, packet_id, seq_number)
+        recv_time = time.time()
+
+        if recv_timestamp:
+            rtt = round((recv_time - recv_timestamp) * 1000, 4)
+            stats["RTTs"].append(rtt)
+            stats["Recv"] += 1
+            stats["Last"] = rtt
+            stats["Best"] = round(min(stats["Best"], rtt), 4)
+            stats["Wrst"] = round(max(stats["Wrst"], rtt), 4)
+            stats["Avg"] = round(sum(stats["RTTs"]) / len(stats["RTTs"]), 4)
+            stats["StDev"] = round(statistics.stdev(stats["RTTs"]), 4) if len(stats["RTTs"]) > 1 else 0.0000
+        else:
+            stats["Loss"] = round(((stats["Snt"] - stats["Recv"]) / stats["Snt"]) * 100, 2)
+
+        result_queue.put(stats.copy())
+        time.sleep(1)
+
+# 从文件加载 IP
+def load_ips(filename="ip.lst"):
     try:
         with open(filename, "r") as f:
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        print(f"错误: 文件 {filename} 不存在！")
+        print(f"错误: {filename} 文件不存在！")
         exit(1)
 
-ip_list = load_ip_list()
-
-# 存储每个 IP 的统计数据
-stats = {}
-stats_lock = threading.Lock()
-
-# 初始化统计数据
-for ip in ip_list:
-    stats[ip] = {
-        'snt': 0,      # 已发送包数
-        'loss': 0,     # 丢失包数
-        'last': None,  # 最后一次延时（ms）
-        'delays': []   # 所有成功的延时
-    }
-
-def icmp_ping(ip):
-    """ 使用 ICMP Echo 请求 ping 目标 IP，并更新统计数据 """
-    while True:
-        with stats_lock:
-            stats[ip]['snt'] += 1  # 记录发送包数
-
-        # 发送 ICMP Echo 请求
-        packet = IP(dst=ip) / ICMP()
-        start_time = time.time()
-
-        reply = sr1(packet, timeout=1, verbose=False)
-
-        end_time = time.time()
-        if reply:
-            rtt = (end_time - start_time) * 1000  # 转换为毫秒
-            with stats_lock:
-                stats[ip]['last'] = rtt
-                stats[ip]['delays'].append(rtt)
-        else:
-            with stats_lock:
-                stats[ip]['loss'] += 1
-                stats[ip]['last'] = None
-
-        time.sleep(1)  # 控制间隔 1 秒
-
-def compute_stats(delays):
-    """计算统计数据"""
-    if not delays:
-        return None, None, None, None
-    avg = sum(delays) / len(delays)
-    best = min(delays)
-    wrst = max(delays)
-    stdev = statistics.stdev(delays) if len(delays) > 1 else 0.0
-    return avg, best, wrst, stdev
-
+# 清屏
 def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    os.system("cls" if os.name == "nt" else "clear")
 
-def display_stats():
-    """实时显示统计结果"""
+# 主线程：定时刷新统计信息
+def display_stats(result_queue, ip_list):
+    stats_map = {ip: {} for ip in ip_list}
+
     while True:
+        while not result_queue.empty():
+            data = result_queue.get()
+            stats_map[data["IP"]] = data
+
         clear_screen()
-        header = f"{'IP地址':15} {'Loss':>8} {'Snt':>6} {'Last':>8} {'Avg':>8} {'Best':>8} {'Wrst':>8} {'StDev':>8}"
+        
+        # 表头
+        header = f"{'IP地址':<18} {'Loss%':<8} {'Snt':<5} {'Last':<10} {'Avg':<10} {'Best':<10} {'Wrst':<10} {'StDev':<10}"
         print(header)
-        print("-" * len(header))
+        print("=" * len(header))
 
-        with stats_lock:
-            for ip in ip_list:
-                snt = stats[ip]['snt']
-                loss_count = stats[ip]['loss']
-                loss_rate = (loss_count / snt * 100) if snt > 0 else 0
-                last = stats[ip]['last']
-                avg, best, wrst, stdev = compute_stats(stats[ip]['delays'])
+        # 逐行打印数据
+        for ip, stats in stats_map.items():
+            if stats:
+                print(f"{stats['IP']:<18} {stats['Loss']:<8.2f} {stats['Snt']:<5} {stats['Last']:<10.4f} {stats['Avg']:<10.4f} {stats['Best']:<10.4f} {stats['Wrst']:<10.4f} {stats['StDev']:<10.4f}")
+            else:
+                print(f"{ip:<18} -       -     -         -         -         -         -         -")
 
-                print(f"{ip:15} {loss_rate:7.2f}% {snt:6d} "
-                      f"{(f'{last:.2f}' if last is not None else '-'):>8} "
-                      f"{(f'{avg:.2f}' if avg is not None else '-'):>8} "
-                      f"{(f'{best:.2f}' if best is not None else '-'):>8} "
-                      f"{(f'{wrst:.2f}' if wrst is not None else '-'):>8} "
-                      f"{(f'{stdev:.2f}' if stdev is not None else '-'):>8}")
         time.sleep(1)
 
-# 启动 ICMP 线程
-threads = []
-for ip in ip_list:
-    t = threading.Thread(target=icmp_ping, args=(ip,), daemon=True)
-    t.start()
-    threads.append(t)
+# 主函数
+def main():
+    ip_list = load_ips()
+    result_queue = queue.Queue()
 
-# 运行显示统计的主线程
-try:
-    display_stats()
-except KeyboardInterrupt:
-    print("程序终止")
+    for ip in ip_list:
+        threading.Thread(target=ping_worker, args=(ip, result_queue), daemon=True).start()
+
+    display_stats(result_queue, ip_list)
+
+if __name__ == "__main__":
+    main()
