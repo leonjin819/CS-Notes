@@ -10,6 +10,20 @@ import queue
 ICMP_ECHO_REQUEST = 8
 ICMP_ECHO_REPLY = 0
 
+'''
+这个任务需要：
+从文件读取 IP 列表
+多线程/多进程并行发送 ICMP 请求
+基于 ICMP 报文时间戳计算 RTT
+主线程每秒清屏刷新一次结果
+
+📌 实现方案
+threading: 每个 IP 启动一个线程执行 ping
+queue.Queue: 用于线程间通信，主线程每秒刷新结果
+os.system("cls" / "clear"): 清屏
+time.sleep(1): 定时刷新
+'''
+
 # 计算校验和
 def checksum(source_string):
     sum = 0
